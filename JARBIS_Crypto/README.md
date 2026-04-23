@@ -1,9 +1,14 @@
 # JARBIS Crypto — 24/7 Trading Bot
 
-Production-grade automated trading bot for BTC / ETH / SOL / XRP on spot and
-perpetual futures, built on the Vilkov 0DTE framework and adapted for crypto
-with **dynamic leverage scaling**, real-time news sentiment, and on-chain
-momentum confirmation.
+Production-grade automated trading bot for the **top-10 liquid perpetuals**
+(BTC / ETH / BNB / SOL / XRP / ADA / DOGE / AVAX / LINK / MATIC) on a
+**single venue: Hyperliquid** — a DEX on its own EVM L1, self-custodied
+via **Metamask** signing. No KYC. Built on the Vilkov 0DTE framework with
+**dynamic leverage scaling** (more leverage during high-confidence
+signals), real-time news sentiment, and on-chain momentum confirmation.
+
+Bybit and Binance stay in the codebase only as **read-only data fallbacks**
+when Hyperliquid's `/info` endpoint hiccups — they never route orders.
 
 > ⚠️ **Crypto trading is high-risk. Leverage amplifies losses.** Start in paper
 > mode. Never deploy capital you cannot afford to lose.
@@ -30,21 +35,28 @@ candles, score news sentiment, and wait for a signal on BTC / ETH / SOL / XRP.
 
 ## What it does
 
+- **Single-venue execution** — Hyperliquid perpetuals, Metamask self-custody.
+- **Top-10 universe lock** — `config.ALLOWED_COINS` rejects any non-top-10
+  ticker at startup; default `TRADING_PAIRS` is the full ten.
 - **Multi-timeframe signals** — 4H EMA trend + 1H RSI/MACD momentum + 15m
   breakout with ATR-scaled stops and 1.5R / 3R take-profits.
 - **Dynamic leverage** — base 2x × sentiment multiplier × ATR20/ATR50 ×
-  portfolio-heat discount, hard-capped at 3x and floor-clamped at 1x (spot).
+  portfolio-heat discount, hard-capped at 3x, floor-clamped at 1x (spot).
 - **News sentiment** — CryptoCompare + NewsAPI crawl, keyword scoring in
   [-1, +1], time-decayed, with manual-injection overrides.
-- **On-chain confirmation** — Santiment exchange-balance delta and Glassnode
-  net-exchange flow. Optional; missing keys degrade gracefully.
+- **On-chain confirmation** — Santiment exchange-balance delta and
+  Glassnode net-exchange flow. Optional; missing keys degrade gracefully.
 - **Risk hard limits** — 2% max loss per trade, 5% max position, 4 concurrent
   trades, 30-minute timeout, 3% portfolio hard loss, emergency flatten.
 - **Paper broker built-in** — realistic fills at limit price, SL/TP/TP2
   mark-to-market, SQLite + CSV audit trail.
-- **Rich dashboard** — live metrics, risk gauges, and the last 15 trades.
-- **Webhooks** — POST `/news` (manual headline injection) and `/emergency`
-  (panic flatten), plus optional Slack outbound notifications.
+- **Rich terminal dashboard** — live metrics, risk gauges, last 15 trades.
+- **Live Artifact dashboard** — single-file React component
+  (`artifacts/JarbisDashboard.jsx`) that pairs with the Flask server on
+  your PC: bot on/off button, confidence gauge (red→yellow→green gradient),
+  @DeItaone breaking-news feed, Hyperliquid top-10 table.
+- **Webhooks** — `GET /state`, `POST /bot/start`, `POST /bot/stop`,
+  `POST /news`, `POST /emergency` (CORS enabled for claude.ai).
 
 ---
 
@@ -54,8 +66,11 @@ candles, score news sentiment, and wait for a signal on BTC / ETH / SOL / XRP.
 main.py ─┬─ signal_loop   (poll prices, generate signals, execute, MTM)
          ├─ sentiment_loop (refresh news every 5min)
          └─ command_loop  (stdin CLI)
+         + bot_active flag (stop/start from dashboard or !start/!stop)
+         + state_snapshot() used by GET /state
 
-broker.py   Bybit primary + Binance fallback + PaperBroker
+broker.py   HyperliquidClient (primary) + Bybit/Binance data fallbacks
+            + PaperBroker (simulated fills)
 signals.py  EMA / RSI / MACD / ATR / support-resistance
 sentiment.py News crawl + keyword scoring + ticker tagging
 on_chain.py  Santiment / Glassnode bullish-signal check
@@ -64,7 +79,11 @@ risk.py     Position sizing, heat, timeouts, hard-loss guard
 orders.py   Glue: signal -> leverage -> sizing -> broker
 logger.py   SQLite trades + portfolio snapshots + CSV mirror
 dashboard.py Rich panels (metrics / risk / trades)
-webhooks.py  Flask /news + /emergency + Slack notify
+webhooks.py  Flask: /news /emergency /bot/start /bot/stop /state (+ CORS)
+
+artifacts/
+  JarbisDashboard.jsx  React Live Artifact (on/off button, confidence
+                       gauge, @DeItaone feed, top-10 markets)
 ```
 
 ---
@@ -90,6 +109,7 @@ Example: `base=2`, `sentiment=+0.8`, `ATR ratio=1.1`, `heat=0.2` →
 
 ```
 !help                              show all commands
+!start  |  !stop                   enable/disable new entries (same as dashboard toggle)
 !close [TICKER]                    close all or one
 !emergency                         panic close everything
 !risk set 0.015                    adjust max loss per trade
@@ -103,20 +123,27 @@ Example: `base=2`, `sentiment=+0.8`, `ATR ratio=1.1`, `heat=0.2` →
 
 ---
 
-## Webhooks
+## Webhooks / API
 
 ```bash
+# Bot on/off (dashboard toggle uses these)
+curl -X POST http://127.0.0.1:5000/bot/start -H "X-JARBIS-Secret: $WEBHOOK_SECRET" -d '{}'
+curl -X POST http://127.0.0.1:5000/bot/stop  -H "X-JARBIS-Secret: $WEBHOOK_SECRET" -d '{}'
+
 # Manual news injection
-curl -X POST http://localhost:5000/news \
+curl -X POST http://127.0.0.1:5000/news \
   -H "X-JARBIS-Secret: $WEBHOOK_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"ticker":"BTC","headline":"ETF approval imminent","score":0.9}'
 
 # Panic button
-curl -X POST http://localhost:5000/emergency \
+curl -X POST http://127.0.0.1:5000/emergency \
   -H "X-JARBIS-Secret: $WEBHOOK_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"confirm":true}'
+
+# Read-only snapshot (public; the Live Artifact polls this)
+curl http://127.0.0.1:5000/state
 ```
 
 ---
@@ -124,12 +151,17 @@ curl -X POST http://localhost:5000/emergency \
 ## Configuration
 
 See `.env.example` for all tunables. Minimal paper-mode config needs zero
-keys — the bot will use Bybit's public market-data endpoints.
+keys — the bot uses Hyperliquid's public `/info` endpoint for data.
 
 Key knobs:
 
 | Env var | Default | Notes |
 |---|---|---|
+| `PRIMARY_BROKER` | hyperliquid | Single venue: `hyperliquid` (DEX, Metamask) |
+| `HL_API_URL` | https://api.hyperliquid.xyz | Override for testnet/mainnet |
+| `HL_WALLET_ADDRESS` | — | 0x… Metamask account used for signing |
+| `HL_PRIVATE_KEY` | — | Only when `PAPER_TRADE=false` |
+| `TRADING_PAIRS` | top-10 | Must be a subset of `ALLOWED_COINS` |
 | `PORTFOLIO_SIZE_USD` | 1000 | Starting paper capital |
 | `MAX_LOSS_PCT` | 0.02 | 2% per trade (risk-first sizing) |
 | `MAX_LEVERAGE` | 3.0 | Hard cap on dynamic leverage |
@@ -137,7 +169,8 @@ Key knobs:
 | `MAX_POSITION_SIZE_PCT` | 0.05 | 5% of portfolio notional per trade |
 | `MAX_CONCURRENT_TRADES` | 4 | Prevent over-exposure |
 | `POSITION_TIMEOUT_MINUTES` | 30 | Force-close slow trades |
-| `PRIMARY_BROKER` | bybit | `bybit` or `binance` |
+| `WEBHOOK_PORT` | 5000 | Flask + dashboard API + CORS |
+| `WEBHOOK_SECRET` | change_me_please | Required for control endpoints |
 | `PAPER_TRADE` | true | Always default true |
 
 ---
@@ -168,15 +201,26 @@ signal label, exit reason (`tp1`, `tp2`, `sl`, `timeout`, `emergency`,
 
 ## Going live
 
-Live order placement against Bybit / Binance is intentionally stubbed
+Live order placement against Hyperliquid is intentionally stubbed
 (`broker.place_limit_order` raises `NotImplementedError` when
 `PAPER_TRADE=false`). To enable it:
 
-1. Wire signed REST endpoints into `BybitClient` / `BinanceClient` (HMAC
-   signing, leverage + margin-mode setup, SL/TP attached to the entry).
-2. Run paper trading for **≥ 2 weeks** to validate your config.
-3. Enable live with **≤ 1% of intended capital** first.
-4. Monitor 24/7 for the first week; use `!emergency` liberally.
+1. Add an EVM signer. Hyperliquid orders are signed L1 actions; the
+   `hyperliquid-python-sdk` package wraps this. Store the key in a local
+   OS keystore, **not** `.env`.
+2. Seed the wallet on Hyperliquid via the UI (Metamask deposit) before
+   the bot tries to place orders.
+3. Run paper trading for **≥ 2 weeks** to validate your config.
+4. Enable live with **≤ 1% of intended capital** first.
+5. Monitor 24/7 for the first week; use `!emergency` or the dashboard's
+   ⛔ button liberally.
+
+## Live Artifact dashboard
+
+The Flask server already exposes `/state` + `/bot/start` + `/bot/stop`
+with CORS `*`, so you can open the React artifact on claude.ai and point
+its **Bot URL** field at `http://127.0.0.1:5000`. Prefs persist in
+`window.storage`. Source: `artifacts/JarbisDashboard.jsx`.
 
 ---
 

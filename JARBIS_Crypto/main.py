@@ -46,8 +46,11 @@ class JarbisBot:
         self.sentiment = SentimentEngine(self.settings)
         self.on_chain = OnChainEngine(self.settings)
         self.logger = TradeLogger(self.settings)
-        self.webhooks = WebhookServer(self.settings)
+        self.webhooks = WebhookServer(self.settings, bot=self)
         self.running = True
+        # Dashboard on/off toggle — when False, signal_loop still refreshes
+        # prices/sentiment so the UI stays live, but no new entries fire.
+        self.bot_active = True
 
         self.risk: Optional[RiskManager] = None
         self.signal_engine: Optional[SignalEngine] = None
@@ -110,7 +113,16 @@ class JarbisBot:
             self._flush_closed()
 
             # 3) try to generate entries for unheld tickers not in cooldown
+            #    (skipped entirely when the bot is toggled OFF — UI still
+            #    polls prices/sentiment, positions still mark-to-market)
             now = time.time()
+            if not self.bot_active:
+                await self._update_leverage_estimates()
+                for ev in self.webhooks.drain():
+                    await self._handle_webhook_event(ev)
+                self._render(live)
+                await asyncio.sleep(poll)
+                continue
             for ticker in self.settings.trading_pairs:
                 if ticker in self.broker.positions():
                     continue
@@ -144,37 +156,48 @@ class JarbisBot:
                 # brief cooldown even on rejection so we don't hammer the same pattern
                 self._cooldown[ticker] = now + max(poll * 2, 60)
 
-            # 4) update leverage estimates for UI (sentiment changes even without entries)
-            for ticker in self.settings.trading_pairs:
-                if ticker in self.broker.positions():
-                    self.current_leverage[ticker] = self.broker.positions()[ticker].leverage
-                else:
-                    try:
-                        atr_ratio = await self.signal_engine.atr_ratio(ticker)
-                    except Exception:  # noqa: BLE001
-                        atr_ratio = 1.0
-                    lev = calculate_leverage(
-                        LeverageInputs(
-                            sentiment_score=self.sentiment.score_for(ticker),
-                            atr_ratio=atr_ratio,
-                            portfolio_heat=self.risk.portfolio_heat(),
-                        ),
-                        self.settings,
-                    )
-                    self.current_leverage[ticker] = lev.leverage
-
-            # 5) drain webhooks
+            # 4) update leverage estimates + drain webhooks + render
+            await self._update_leverage_estimates()
             for ev in self.webhooks.drain():
-                if ev.kind == "news":
-                    self.sentiment.inject_manual(
-                        ev.payload["ticker"], ev.payload["headline"],
-                        ev.payload.get("score"),
-                    )
-                elif ev.kind == "emergency":
-                    await self._emergency_flatten()
-
+                await self._handle_webhook_event(ev)
             self._render(live)
             await asyncio.sleep(poll)
+
+    async def _update_leverage_estimates(self) -> None:
+        """Refresh per-ticker dynamic leverage for the UI."""
+        assert self.risk and self.signal_engine
+        for ticker in self.settings.trading_pairs:
+            if ticker in self.broker.positions():
+                self.current_leverage[ticker] = self.broker.positions()[ticker].leverage
+                continue
+            try:
+                atr_ratio = await self.signal_engine.atr_ratio(ticker)
+            except Exception:  # noqa: BLE001
+                atr_ratio = 1.0
+            lev = calculate_leverage(
+                LeverageInputs(
+                    sentiment_score=self.sentiment.score_for(ticker),
+                    atr_ratio=atr_ratio,
+                    portfolio_heat=self.risk.portfolio_heat(),
+                ),
+                self.settings,
+            )
+            self.current_leverage[ticker] = lev.leverage
+
+    async def _handle_webhook_event(self, ev) -> None:
+        if ev.kind == "news":
+            self.sentiment.inject_manual(
+                ev.payload["ticker"], ev.payload["headline"],
+                ev.payload.get("score"),
+            )
+        elif ev.kind == "emergency":
+            await self._emergency_flatten()
+        elif ev.kind == "bot_start":
+            self.bot_active = True
+            self.console.print("[green]bot activated via webhook[/]")
+        elif ev.kind == "bot_stop":
+            self.bot_active = False
+            self.console.print("[yellow]bot deactivated via webhook[/]")
 
     async def sentiment_loop(self) -> None:
         while self.running:
@@ -232,6 +255,12 @@ class JarbisBot:
                 await self._close_positions(args[0] if args else None)
             elif cmd == "emergency":
                 await self._emergency_flatten()
+            elif cmd == "start":
+                self.bot_active = True
+                self.console.print("[green]bot ACTIVE — new entries enabled[/]")
+            elif cmd == "stop":
+                self.bot_active = False
+                self.console.print("[yellow]bot IDLE — no new entries (open positions still managed)[/]")
             elif cmd == "risk" and len(args) == 2 and args[0] in ("increase", "decrease", "set"):
                 pct = float(args[1])
                 self.risk.set_max_loss_pct(pct)  # type: ignore[union-attr]
@@ -290,6 +319,105 @@ class JarbisBot:
     # ---- helpers ----
 
     _last_flushed_count = 0
+
+    def state_snapshot(self) -> dict:
+        """JSON-serializable state for the dashboard ``GET /state`` endpoint.
+
+        Called from the Flask thread so it must not touch asyncio objects;
+        it only reads plain dicts / numbers from the bot's current state.
+        Confidence per coin = ((sentiment + 1) / 2) * 100 scaled by
+        volatility alignment — purely visual, kept simple on purpose.
+        """
+        from .sentiment import classify_sentiment
+        positions = []
+        unrealized_total = 0.0
+        for ticker, pos in self.broker.positions().items():
+            price = self.prices.get(ticker, pos.entry_price)
+            pnl = (price - pos.entry_price) * pos.quantity
+            if pos.direction == "short":
+                pnl = -pnl
+            unrealized_total += pnl
+            positions.append({
+                "ticker": ticker,
+                "direction": pos.direction,
+                "quantity": pos.quantity,
+                "entry": pos.entry_price,
+                "current": price,
+                "pnl": pnl,
+                "pnl_pct": pnl / (pos.entry_price * pos.quantity) if pos.quantity else 0.0,
+                "leverage": pos.leverage,
+                "stop_loss": pos.stop_loss,
+                "tp1": pos.take_profit_1,
+                "tp2": pos.take_profit_2,
+                "tp1_hit": pos.tp1_hit,
+                "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
+            })
+
+        sentiment_data = {}
+        confidence = {}
+        for ticker in self.settings.trading_pairs:
+            score = self.sentiment.score_for(ticker)
+            sentiment_data[ticker] = {
+                "score": score,
+                "label": classify_sentiment(score),
+            }
+            # Simple visual confidence: sentiment + leverage headroom.
+            lev = self.current_leverage.get(ticker, self.settings.base_leverage)
+            lev_pct = lev / max(self.settings.max_leverage, 1.0)  # 0..1
+            raw = 0.5 + 0.4 * score + 0.1 * (lev_pct - 0.5)
+            confidence[ticker] = max(0.0, min(1.0, raw)) * 100.0
+
+        stats = self.logger.stats(limit=50)
+        recent = []
+        for row in self.logger.recent_trades(limit=10):
+            (ticker, direction, entry_p, exit_p, qty, lev, pnl, pnl_pct,
+             sent_label, exit_reason, entry_time) = row
+            recent.append({
+                "ticker": ticker, "direction": direction,
+                "entry": entry_p, "exit": exit_p, "quantity": qty,
+                "leverage": lev, "pnl": pnl, "pnl_pct": pnl_pct,
+                "sentiment_label": sent_label, "exit_reason": exit_reason,
+                "entry_time": entry_time,
+            })
+
+        # Active trade = most recently opened; confidence of that ticker.
+        active_trade = None
+        if positions:
+            newest = max(positions, key=lambda p: p["opened_at"] or "")
+            active_trade = {
+                "ticker": newest["ticker"],
+                "confidence": confidence.get(newest["ticker"], 50.0),
+            }
+
+        return {
+            "mode": "LIVE" if not self.settings.paper_trade else "PAPER",
+            "bot_active": self.bot_active,
+            "venue": self.broker.venue_name,
+            "trading_pairs": list(self.settings.trading_pairs),
+            "balance": self.broker.cash(),
+            "available_margin": self.broker.available_margin(),
+            "unrealized_pnl": unrealized_total,
+            "portfolio_heat": self.risk.portfolio_heat() if self.risk else 0.0,
+            "max_loss_pct": self.risk.max_loss_pct if self.risk else self.settings.max_loss_pct,
+            "max_leverage": self.settings.max_leverage,
+            "base_leverage": self.settings.base_leverage,
+            "prices": dict(self.prices),
+            "leverage": dict(self.current_leverage),
+            "sentiment": sentiment_data,
+            "confidence": confidence,
+            "active_trade": active_trade,
+            "positions": positions,
+            "recent_trades": recent,
+            "stats": {
+                "total_trades": stats.total_trades,
+                "wins": stats.wins,
+                "losses": stats.losses,
+                "win_rate": stats.win_rate,
+                "total_pnl": stats.total_pnl,
+                "best": stats.best_trade,
+                "worst": stats.worst_trade,
+            },
+        }
 
     def _just_closed_ids(self) -> list[str]:
         return [p.order_id for p in self.broker.closed_positions()]

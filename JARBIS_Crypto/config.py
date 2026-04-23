@@ -13,6 +13,17 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# ------------------------------------------------------------------
+# Hard rule: bot only trades the 10 most liquid perpetual coins.
+# Enforced below via a validator; mutating this list is intentional
+# and should be accompanied by an updated dashboard universe too.
+# ------------------------------------------------------------------
+ALLOWED_COINS: List[str] = [
+    "BTC", "ETH", "BNB", "SOL", "XRP",
+    "ADA", "DOGE", "AVAX", "LINK", "MATIC",
+]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -21,7 +32,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Broker keys
+    # --- Execution venue: Hyperliquid (DEX perps, Metamask self-custody, no KYC) ---
+    # Hyperliquid is the single trading venue. Bybit + Binance are retained
+    # only as read-only data redundancy for candles / tickers when the
+    # Hyperliquid info endpoint is degraded.
+    hl_api_url: str = "https://api.hyperliquid.xyz"
+    hl_wallet_address: str = ""  # 0x... Metamask account used to sign trades
+    hl_private_key: str = ""     # only used in live mode; keep off disk in prod
+
     bybit_api_key: str = ""
     bybit_api_secret: str = ""
     bybit_testnet: bool = True
@@ -30,7 +48,7 @@ class Settings(BaseSettings):
     binance_api_secret: str = ""
     binance_testnet: bool = True
 
-    primary_broker: Literal["bybit", "binance"] = "bybit"
+    primary_broker: Literal["hyperliquid", "bybit", "binance"] = "hyperliquid"
 
     # Portfolio & risk
     portfolio_size_usd: float = 1000.0
@@ -41,7 +59,7 @@ class Settings(BaseSettings):
     max_concurrent_trades: int = 4
 
     # Trading pairs & timeframes
-    trading_pairs: List[str] = Field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
+    trading_pairs: List[str] = Field(default_factory=lambda: list(ALLOWED_COINS))
     timeframes: List[str] = Field(default_factory=lambda: ["4h", "1h", "15m"])
 
     # Sentiment & data APIs
@@ -78,6 +96,17 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [p.strip().upper() if p.strip().isalpha() else p.strip()
                     for p in v.split(",") if p.strip()]
+        return v
+
+    @field_validator("trading_pairs")
+    @classmethod
+    def _enforce_top10_universe(cls, v: List[str]) -> List[str]:
+        invalid = [t for t in v if t not in ALLOWED_COINS]
+        if invalid:
+            raise ValueError(
+                f"trading_pairs must be a subset of top-10: {ALLOWED_COINS}. "
+                f"Disallowed: {invalid}"
+            )
         return v
 
     @field_validator("max_loss_pct", "max_position_size_pct")

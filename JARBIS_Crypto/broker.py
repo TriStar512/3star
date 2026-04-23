@@ -1,10 +1,15 @@
-"""Broker abstraction: Bybit primary + Binance fallback + paper engine.
+"""Broker abstraction: Hyperliquid primary + Bybit/Binance data fallback + paper engine.
+
+Execution venue is Hyperliquid — a DEX on its own EVM L1, self-custodied
+via Metamask signing. No KYC. Public REST (``/info``) needs no auth and
+is used for candles / ticker context / funding / max-leverage metadata.
+
+Bybit and Binance remain wired only as read-only fallbacks for market
+data redundancy (same public endpoints as before, no keys required).
 
 The paper broker simulates fills at the requested limit price and tracks
-positions in-memory. Live brokers wrap the public REST endpoints (no
-signing is required for candles and tickers, which is all we need for
-signal generation). Actual order placement against a live exchange should
-be wired in before enabling ``PAPER_TRADE=false``.
+positions in-memory. Signed order placement against Hyperliquid must be
+wired in before enabling ``PAPER_TRADE=false``.
 """
 from __future__ import annotations
 
@@ -65,6 +70,115 @@ class Order:
     leverage: float
     status: str = "filled"  # paper-mode assumes instant fill at limit
     timestamp: pd.Timestamp = field(default_factory=lambda: pd.Timestamp.utcnow())
+
+
+# ----- Hyperliquid public market data -----
+
+class HyperliquidClient:
+    """Read-only Hyperliquid ``/info`` client (no auth required).
+
+    Public info endpoint accepts JSON POSTs with a ``type`` discriminator.
+    All candles, mark prices, funding rates, and universe metadata flow
+    through this single URL. Order placement is deferred until the
+    signing layer is wired in (same pattern as the old Bybit live stub).
+    """
+
+    INTERVAL_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+
+    def __init__(self, settings: Settings, session: aiohttp.ClientSession):
+        self.settings = settings
+        self.session = session
+        self.base_url = settings.hl_api_url.rstrip("/")
+        # cached universe / leverage caps — refreshed on first use
+        self._universe: Optional[list] = None
+        self._asset_ctxs: Optional[list] = None
+        self._index_by_coin: Dict[str, int] = {}
+
+    async def _post(self, body: dict) -> dict | list:
+        url = f"{self.base_url}/info"
+        async with self.session.post(url, json=body, timeout=15) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    async def _ensure_meta(self) -> None:
+        if self._universe is not None and self._asset_ctxs is not None:
+            return
+        data = await async_retry(self._post, {"type": "metaAndAssetCtxs"})
+        meta, ctxs = data[0], data[1]
+        self._universe = meta.get("universe", [])
+        self._asset_ctxs = ctxs
+        self._index_by_coin = {u["name"].upper(): i for i, u in enumerate(self._universe)}
+
+    async def _refresh_ctxs(self) -> None:
+        """Re-pull only the changing asset contexts; universe is stable."""
+        data = await async_retry(self._post, {"type": "metaAndAssetCtxs"})
+        self._universe = data[0].get("universe", self._universe)
+        self._asset_ctxs = data[1]
+        self._index_by_coin = {u["name"].upper(): i for i, u in enumerate(self._universe or [])}
+
+    async def get_candles(self, ticker: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
+        coin = ticker.upper()
+        interval = self.INTERVAL_MAP.get(timeframe, "15m")
+        interval_ms = _interval_to_ms(interval)
+        end_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+        start_ms = end_ms - interval_ms * limit
+        rows = await async_retry(
+            self._post,
+            {
+                "type": "candleSnapshot",
+                "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms},
+            },
+        )
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(
+            [
+                {
+                    "open_time": r["t"],
+                    "open": float(r["o"]),
+                    "high": float(r["h"]),
+                    "low": float(r["l"]),
+                    "close": float(r["c"]),
+                    "volume": float(r.get("v", 0.0)),
+                }
+                for r in rows
+            ]
+        )
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        return df.set_index("open_time")
+
+    async def get_ticker_price(self, ticker: str) -> float:
+        await self._refresh_ctxs()
+        coin = ticker.upper()
+        idx = self._index_by_coin.get(coin)
+        if idx is None or self._asset_ctxs is None:
+            raise RuntimeError(f"hyperliquid: no such coin {coin}")
+        ctx = self._asset_ctxs[idx]
+        price = ctx.get("markPx") or ctx.get("midPx") or ctx.get("oraclePx")
+        if price is None:
+            raise RuntimeError(f"hyperliquid: no mark price for {coin}")
+        return float(price)
+
+    async def get_funding_rate(self, ticker: str) -> float:
+        await self._refresh_ctxs()
+        coin = ticker.upper()
+        idx = self._index_by_coin.get(coin)
+        if idx is None or self._asset_ctxs is None:
+            return 0.0
+        return float(self._asset_ctxs[idx].get("funding", 0.0) or 0.0)
+
+    async def get_max_leverage(self, ticker: str) -> float:
+        await self._ensure_meta()
+        coin = ticker.upper()
+        idx = self._index_by_coin.get(coin)
+        if idx is None or self._universe is None:
+            return 0.0
+        return float(self._universe[idx].get("maxLeverage", 0.0) or 0.0)
+
+
+def _interval_to_ms(interval: str) -> int:
+    units = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    return int(interval[:-1]) * units.get(interval[-1], 60_000)
 
 
 # ----- Bybit public market data -----
@@ -291,59 +405,84 @@ class PaperBroker:
 
 # ----- Broker facade -----
 
+_DataClient = "HyperliquidClient | BybitClient | BinanceClient"
+
+
 class Broker:
-    """Single entry-point used by the rest of the bot."""
+    """Single entry-point used by the rest of the bot.
+
+    Execution venue = Hyperliquid. Bybit + Binance sit behind it only as
+    read-only data fallbacks when the ``/info`` endpoint hiccups.
+    """
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         self.session: Optional[aiohttp.ClientSession] = None
-        self.primary: BybitClient | BinanceClient | None = None
-        self.fallback: BybitClient | BinanceClient | None = None
+        self.primary: Optional[_DataClient] = None
+        self.fallbacks: List[_DataClient] = []
         self.paper = PaperBroker(self.settings)
+        self.venue_name: str = self.settings.primary_broker
 
     async def __aenter__(self) -> "Broker":
         self.session = aiohttp.ClientSession()
-        if self.settings.primary_broker == "bybit":
-            self.primary = BybitClient(self.settings, self.session)
-            self.fallback = BinanceClient(self.settings, self.session)
-        else:
-            self.primary = BinanceClient(self.settings, self.session)
-            self.fallback = BybitClient(self.settings, self.session)
+        hl = HyperliquidClient(self.settings, self.session)
+        by = BybitClient(self.settings, self.session)
+        bn = BinanceClient(self.settings, self.session)
+        order = {
+            "hyperliquid": (hl, [by, bn]),
+            "bybit":       (by, [hl, bn]),
+            "binance":     (bn, [hl, by]),
+        }
+        self.primary, self.fallbacks = order[self.settings.primary_broker]
         return self
 
     async def __aexit__(self, *exc) -> None:
         if self.session:
             await self.session.close()
 
+    async def _try_chain(self, fn_name: str, *args, **kwargs):
+        assert self.primary
+        clients = [self.primary, *self.fallbacks]
+        last_exc: Exception | None = None
+        for c in clients:
+            try:
+                return await getattr(c, fn_name)(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s on %s failed, trying next: %s",
+                            fn_name, type(c).__name__, exc)
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
+
     async def get_candles(self, ticker: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
-        assert self.primary and self.fallback
-        try:
-            return await self.primary.get_candles(ticker, timeframe, limit)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("primary broker candles failed, falling back: %s", exc)
-            return await self.fallback.get_candles(ticker, timeframe, limit)
+        return await self._try_chain("get_candles", ticker, timeframe, limit)
 
     async def get_price(self, ticker: str) -> float:
-        assert self.primary and self.fallback
-        try:
-            return await self.primary.get_ticker_price(ticker)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("primary broker price failed, falling back: %s", exc)
-            return await self.fallback.get_ticker_price(ticker)
+        return await self._try_chain("get_ticker_price", ticker)
 
     async def get_funding_rate(self, ticker: str) -> float:
-        assert self.primary
         try:
-            return await self.primary.get_funding_rate(ticker)
+            return await self._try_chain("get_funding_rate", ticker)
         except Exception:
             return 0.0
+
+    async def get_max_leverage(self, ticker: str) -> float:
+        """Only Hyperliquid exposes a universe-level max leverage today."""
+        if isinstance(self.primary, HyperliquidClient):
+            try:
+                return await self.primary.get_max_leverage(ticker)
+            except Exception:
+                return 0.0
+        return 0.0
 
     # --- order routing ---
     async def place_limit_order(self, **kwargs) -> Order:
         if self.settings.paper_trade:
             return await self.paper.place_limit_order(**kwargs)
         raise NotImplementedError(
-            "Live order placement not wired. Set PAPER_TRADE=true or add signed endpoints."
+            "Live order placement not wired. Hyperliquid orders need an EVM "
+            "signer (Metamask private key). Set PAPER_TRADE=true until the "
+            "signing layer is added."
         )
 
     def positions(self) -> Dict[str, Position]:

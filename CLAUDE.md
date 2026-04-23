@@ -1,8 +1,9 @@
 # JARBIS Crypto — Project Memory
 
-24/7 automated crypto trading bot for BTC/ETH/SOL/XRP on spot + perpetual
-futures. Adapts the Vilkov 0DTE framework to crypto with dynamic leverage,
-news sentiment, and on-chain confirmation.
+24/7 automated crypto trading bot running on PC, **single-venue execution
+on Hyperliquid** (DEX perps, Metamask self-custody, no KYC). Vilkov 0DTE
+framework adapted to crypto with dynamic leverage, news sentiment, and
+on-chain confirmation.
 
 ## Repo
 
@@ -10,106 +11,135 @@ news sentiment, and on-chain confirmation.
 - Primary dev branch: `claude/jarbis-crypto-bot-H4yXe`
 - Open PR: #1 (base `main`)
 - All bot code lives in `JARBIS_Crypto/` package
+- Subscribed to PR #1 activity
 
-## Run
+## Hard rules (enforced in code, not suggestions)
+
+1. **One venue only: Hyperliquid.** `PRIMARY_BROKER=hyperliquid`. Bybit
+   and Binance clients are retained *only* as read-only data fallbacks
+   for the candle / ticker chain. They never route orders.
+2. **Top-10 coin universe.** `config.ALLOWED_COINS = [BTC, ETH, BNB, SOL,
+   XRP, ADA, DOGE, AVAX, LINK, MATIC]`. A pydantic validator rejects
+   any `TRADING_PAIRS` value outside this list at startup.
+3. **Dynamic leverage scales with confidence** — the existing formula:
+   ```
+   leverage = clamp(
+       base_leverage
+       * (1 + sentiment_score * 0.5)    # [0.5, 1.5]
+       * min(ATR20 / ATR50, 1.5)        # volatility factor
+       * max(0.5, 1 - portfolio_heat),  # heat discount
+       lo=1.0, hi=max_leverage          # 1x floor, 3x cap
+   )
+   ```
+   Higher sentiment + lower vol + lower heat ⇒ more leverage, capped.
+4. **Metamask self-custody for live mode.** `HL_WALLET_ADDRESS` +
+   `HL_PRIVATE_KEY` (off-disk in production). Live order placement is
+   stubbed with `NotImplementedError` until the signer is wired.
+5. **Risk hard limits (unchanged):** 2% max loss / trade, 5% max notional,
+   4 concurrent, 30-min timeout, 3% portfolio hard loss, emergency flatten.
+
+## Run (PC, paper mode)
 
 ```bash
 pip install -r JARBIS_Crypto/requirements.txt
-cp JARBIS_Crypto/.env.example JARBIS_Crypto/.env   # fill keys (optional for paper)
+cp JARBIS_Crypto/.env.example JARBIS_Crypto/.env   # optional keys
 python -m JARBIS_Crypto.main --paper
 ```
 
-Tests: `pytest JARBIS_Crypto/tests` (32 tests, all passing).
+Tests: `pytest JARBIS_Crypto/tests` — 38 tests, all passing.
 
 ## Architecture (file map)
 
 | File | Purpose |
 |---|---|
-| `main.py` | Async event loop: `signal_loop`, `sentiment_loop`, `command_loop` + Rich Live dashboard |
-| `config.py` | `pydantic-settings` typed config from `.env`; `get_settings()` memoized |
-| `broker.py` | `BybitClient` (primary), `BinanceClient` (fallback), `PaperBroker`, `Broker` facade |
-| `signals.py` | EMA / RSI / MACD / ATR / support-resistance + `SignalEngine` (4H trend, 1H momentum, 15m breakout) |
-| `sentiment.py` | CryptoCompare + NewsAPI crawl, keyword scoring, per-ticker time-decayed score, manual injection |
-| `on_chain.py` | Santiment exchange-balance + Glassnode netflow bullish-signal check |
-| `leverage.py` | `calculate_leverage(LeverageInputs, …)` — formula below |
-| `risk.py` | `RiskManager` — sizing, heat, timeout/hard-loss gates, concurrency cap |
-| `orders.py` | `OrderRouter.execute(signal, atr_ratio)` — glue: leverage → sizing → broker |
-| `logger.py` | `TradeLogger` — SQLite (`trades`, `portfolio_snapshots`) + CSV mirror, stats |
-| `dashboard.py` | Rich panels: metrics / risk / recent trades |
-| `webhooks.py` | Flask `POST /news`, `POST /emergency` (auth `X-JARBIS-Secret`) + Slack notify |
-| `utils.py` | Formatters, `async_retry`, sentiment classifier |
-| `tests/` | `test_leverage.py`, `test_sentiment.py`, `test_risk.py`, `test_signals.py` |
-| `artifacts/CexLeverageTracker.jsx` | React Live Artifact: top-10 perp leverage tracker (Bybit/OKX, public REST, auto-refresh, sortable) |
-| `artifacts/README.md` | Live Artifacts index + usage notes |
+| `main.py` | Async event loop: `signal_loop`, `sentiment_loop`, `command_loop` + Rich Live dashboard. Has `bot_active` flag + `state_snapshot()` for the dashboard. `!start` / `!stop` CLI commands gate new entries without killing the process. |
+| `config.py` | `pydantic-settings` typed config. Exports `ALLOWED_COINS` constant + validator that rejects non-top-10 tickers. `primary_broker` defaults to `"hyperliquid"`. |
+| `broker.py` | `HyperliquidClient` (primary) + `BybitClient` + `BinanceClient` (data fallbacks only) + `PaperBroker`. `Broker._try_chain(...)` walks the fallback list for every data call. |
+| `signals.py` | EMA / RSI / MACD / ATR / support-resistance + `SignalEngine` (4H trend, 1H momentum, 15m breakout). |
+| `sentiment.py` | CryptoCompare + NewsAPI crawl, keyword scoring, per-ticker time-decayed score, manual injection. |
+| `on_chain.py` | Santiment exchange-balance + Glassnode netflow bullish-signal check. |
+| `leverage.py` | `calculate_leverage(LeverageInputs, …)` — formula above. |
+| `risk.py` | `RiskManager` — sizing, heat, timeout/hard-loss gates, concurrency cap. |
+| `orders.py` | `OrderRouter.execute(signal, atr_ratio)` — glue: leverage → sizing → broker. |
+| `logger.py` | `TradeLogger` — SQLite (`trades`, `portfolio_snapshots`) + CSV mirror, stats. |
+| `dashboard.py` | Rich terminal panels: metrics / risk / recent trades. |
+| `webhooks.py` | Flask app (runs in thread) serving `/state` (public, CORS `*`), `/bot/start`, `/bot/stop`, `/news`, `/emergency`, `/healthz`. |
+| `utils.py` | Formatters, `async_retry`, sentiment classifier. |
+| `tests/` | `test_leverage.py`, `test_sentiment.py`, `test_risk.py`, `test_signals.py`, `test_config.py` — 38 tests, all passing. |
+| `artifacts/JarbisDashboard.jsx` | **Live Artifact** — React dashboard. On/off bot button, confidence gauge (red→yellow→green gradient), @DeItaone X-timeline embed, Hyperliquid top-10 table, positions table, recent trades, stats. Sized for half-screen 1280×1440. Polls `/state` and issues `/bot/*` control calls. |
+| `artifacts/README.md` | Live Artifacts index + usage notes. |
 
-## Leverage formula (core invariant)
+## Live Artifact dashboard (JarbisDashboard.jsx)
 
-```
-leverage = clamp(
-    base_leverage
-    * (1 + sentiment_score * 0.5)    # [0.5, 1.5] from score ∈ [-1, +1]
-    * min(ATR20 / ATR50, 1.5)        # volatility dampener
-    * max(0.5, 1 - portfolio_heat),  # heat discount
-    lo=1.0, hi=max_leverage          # defaults: 1x floor, 3x cap
-)
-```
+Single-file React component. Runs as a Claude Live Artifact on
+claude.ai or in any React app. Points at the local bot via URL field
+(default `http://127.0.0.1:5000`) + the webhook secret. CORS on the
+Flask server permits loopback from https://claude.ai.
 
-Worked example from spec: `base=2, sent=+0.8, ATR=1.1, heat=0.2` → **2.46x**.
+**Features**
+- START BOT / STOP BOT toggle (POSTs `/bot/start` or `/bot/stop`)
+- ⛔ Emergency flatten (POSTs `/emergency`)
+- Stat tiles: balance, unrealized P&L, heat, available margin
+- Open-positions table (click to focus the gauge)
+- **Confidence gauge** — SVG semicircle with red→yellow→green gradient,
+  auto-derived from sentiment + leverage headroom, manual slider override
+- Top-10 Hyperliquid market table (price, 24h %, max lev, funding, dyn
+  lev, sentiment, day vol)
+- **@DeItaone** breaking-news embed via `platform.twitter.com/widgets.js`,
+  with graceful fallback message + "open in X" link
+- Recent trades table + stats panel
 
-## Risk hard limits (enforced in `risk.py`)
+**Persistence** (`window.storage` → `localStorage` → memory):
+`jarbis.botUrl`, `jarbis.secret`, `jarbis.refresh`,
+`jarbis.selectedCoin`, `jarbis.manualConfidence`
 
-- 2% max loss per trade (risk-first sizing)
-- 5% max notional per position
-- 4 concurrent trades max
-- 30-minute position timeout
-- 3% portfolio hard-loss → auto-close
-- Emergency flatten on CLI `!emergency` or `POST /emergency`
+## Flask API (for dashboard)
 
-## Live-mode safety
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET  /state` | public | Full bot snapshot (positions, prices, sentiment, confidence, stats) |
+| `POST /bot/start` | `X-JARBIS-Secret` | Resume new entries |
+| `POST /bot/stop` | `X-JARBIS-Secret` | Pause new entries (open positions still managed) |
+| `POST /news` | `X-JARBIS-Secret` | Inject manual headline |
+| `POST /emergency` | `X-JARBIS-Secret` | Flatten every open position |
+| `GET  /healthz` | public | Liveness |
 
-- `PAPER_TRADE=true` is the default
-- `Broker.place_limit_order` raises `NotImplementedError` when `paper_trade=False`
-  — signed REST endpoints must be wired before live
-- `!live` CLI requires 3 explicit confirmations
+CORS enabled (`*`) so the Live Artifact on claude.ai can poll localhost.
 
 ## CLI commands
 
 ```
-!close [TICKER]        !emergency           !risk set 0.015
-!leverage set 2.5      !leverage auto       !news TICKER: text
-!paper                 !live confirm (x3)   !stats | !heat | !sentiment
-!positions             !on-chain TICKER     !quit | !help
+!start                 !stop                  !close [TICKER]
+!emergency             !risk set 0.015        !leverage set 2.5
+!leverage auto         !news TICKER: text     !paper
+!live confirm (x3)     !stats | !heat         !sentiment | !positions
+!on-chain TICKER       !quit | !help
 ```
 
 ## Conventions / gotchas
 
 - No ta-lib; pandas-only indicators (keeps deps minimal)
-- Market data endpoints are public (no signing for candles/price/funding)
+- All market-data endpoints on Hyperliquid are public (no signing)
 - `Broker` is async context manager — always used via `async with`
-- RSI saturates to 100 when `avg_loss==0` (fixed in `signals.py`); default is 50 when both gain/loss zero
-- Paper sizing test uses `distance=50` to avoid the notional cap — tight stops always cap at `portfolio × max_position_pct × leverage`
+- RSI saturates to 100 when `avg_loss==0`; 50 when both gain/loss zero
+- Paper sizing test uses `distance=50` to avoid the notional cap
+- `state_snapshot()` runs on the Flask thread; reads are best-effort,
+  no asyncio locks (all touched fields are plain dicts / numbers)
+- `bot_active=False` leaves price-polling + mark-to-market running;
+  only new entries are suppressed
 - `.gitignore` excludes `__pycache__`, `.env`, `*.db`, `*.csv`
 
 ## PR status (as of last check)
 
 - PR #1 open against `main`
-- No check runs configured on the repo yet (no CI workflow)
+- No check runs configured on the repo (no CI workflow yet)
 - No review comments, no reviews, no issue comments
-- Session is subscribed to PR activity
-
-## Live Artifacts (React, claude.ai/code-friendly)
-
-- `JARBIS_Crypto/artifacts/CexLeverageTracker.jsx` — CEX perp leverage
-  tracker. Top 10 coins (BTC, ETH, BNB, SOL, XRP, ADA, DOGE, AVAX, LINK,
-  MATIC). Bybit + OKX public REST; columns: price, 24h %, 24h vol, max
-  leverage, funding, spread, bid, ask — all sortable. Persists CEX choice,
-  refresh interval, last-update, sort state via `window.storage` (falls
-  back to `localStorage`). 30s auto-refresh by default.
+- Session subscribed to PR activity
 
 ## Next steps (not started)
 
-- [ ] Wire signed Bybit REST endpoints for live order placement (HMAC, leverage + margin-mode setup, attached SL/TP)
-- [ ] Bybit testnet smoke run with real keys
+- [ ] Wire Hyperliquid signed actions for live mode (`hyperliquid-python-sdk`)
+- [ ] Hyperliquid testnet smoke run with a Metamask burner wallet
 - [ ] Add a GitHub Actions CI workflow (pytest on push)
 - [ ] Backtest engine over historical 15m/1h candles
 - [ ] ≥ 2 weeks paper-mode validation before any live switch
