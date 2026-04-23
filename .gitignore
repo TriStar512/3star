@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# venv
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Bot runtime artifacts
+.env
+*.db
+*.csv
+trades.db
+trades.csv
+logs/
