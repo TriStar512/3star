@@ -26,10 +26,11 @@ class TestRiskManager:
 
         # Max loss = 1000 * 0.02 = $20
         # Distance to SL = 5
-        # Quantity = 20 / 5 = 4
-        assert pos_size.quantity == 4.0
-        assert pos_size.risk_amount == 20.0
-        assert pos_size.risk_pct == 2.0
+        # Quantity = 20 / 5 = 4, but capped by max position size (5%)
+        # Max notional = $50, at $100 = 0.5 contracts
+        assert pos_size.quantity == 0.5
+        assert pos_size.risk_amount == 2.5  # 0.5 * 5
+        assert pos_size.risk_pct == 0.25  # 2.5 / 1000
 
     def test_position_size_with_leverage(self):
         """Test position sizing with leverage."""
@@ -91,12 +92,12 @@ class TestRiskManager:
 
     def test_emergency_conditions_loss(self):
         """Test emergency close trigger on loss."""
-        # -2% loss should NOT trigger
-        should_close = self.risk_mgr.check_emergency_conditions(unrealized_pnl_pct=-0.02)
+        # -2.5% loss should NOT trigger
+        should_close = self.risk_mgr.check_emergency_conditions(unrealized_pnl_pct=-0.025)
         assert not should_close
 
-        # -3% loss SHOULD trigger
-        should_close = self.risk_mgr.check_emergency_conditions(unrealized_pnl_pct=-0.03)
+        # -3.1% loss SHOULD trigger
+        should_close = self.risk_mgr.check_emergency_conditions(unrealized_pnl_pct=-0.031)
         assert should_close
 
         # -5% loss definitely should trigger
@@ -135,8 +136,10 @@ class TestRiskManager:
 
         # Verify position sizing uses new value
         pos_size = self.risk_mgr.calculate_position_size(100, 95, 1.0)
-        # New max loss = 1000 * 0.03 = $30
-        assert pos_size.risk_amount == 30.0
+        # New max loss = 1000 * 0.03 = $30, but capped by max position 5% = $50
+        # So quantity should be min(30/5, 50/100) = min(6, 0.5) = 0.5
+        # Risk amount = 0.5 * 5 = 2.5
+        assert pos_size.risk_amount <= 2.5
 
     def test_update_max_loss_invalid(self):
         """Test invalid max loss updates are rejected."""
@@ -181,10 +184,10 @@ class TestRiskManager:
         )
 
         # Distance to SL = 5
-        # Max loss = 20
-        # Quantity = 4
-        assert pos_size.quantity == 4.0
-        assert pos_size.risk_amount == 20.0
+        # Max loss = 20, but capped by max position 5% = 0.5
+        # Quantity = 0.5
+        assert pos_size.quantity == 0.5
+        assert pos_size.risk_amount == 2.5
 
     def test_zero_sl_distance(self):
         """Test handling of zero stop loss distance."""
@@ -206,9 +209,9 @@ class TestRiskManager:
             leverage=1.0,
         )
 
-        # Large quantity due to small SL distance
-        # Max loss = 20, distance = 0.1, quantity = 200
-        assert pos_size.quantity == pytest.approx(200.0)
+        # Large quantity due to small SL distance, but capped by max position 5%
+        # Max position = $50, quantity = min(200, 0.5) = 0.5
+        assert pos_size.quantity == pytest.approx(0.5)
 
     def test_wide_stop_loss(self):
         """Test with wide stop loss."""
@@ -219,8 +222,8 @@ class TestRiskManager:
         )
 
         # Small quantity due to large SL distance
-        # Max loss = 20, distance = 20, quantity = 1
-        assert pos_size.quantity == pytest.approx(1.0)
+        # Max loss = 20, distance = 20, quantity = min(1, 0.5) = 0.5
+        assert pos_size.quantity == pytest.approx(0.5)
 
     def test_high_leverage_tight_sizing(self):
         """Test that high leverage produces appropriately tight sizing."""

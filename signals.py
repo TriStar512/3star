@@ -5,7 +5,6 @@ from typing import Optional, List, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 import pandas as pd
-import pandas_ta as ta
 
 logger = logging.getLogger(__name__)
 
@@ -33,20 +32,34 @@ class SignalGenerator:
 
     def calculate_ema(self, prices: pd.Series, period: int) -> pd.Series:
         """Calculate Exponential Moving Average."""
-        return ta.ema(prices, length=period)
+        return prices.ewm(span=period, adjust=False).mean()
 
     def calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
         """Calculate Relative Strength Index."""
-        return ta.rsi(prices, length=period)
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
 
     def calculate_macd(self, prices: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
         """Calculate MACD (12, 26, 9)."""
-        macd_result = ta.macd(prices, fast=12, slow=26, signal=9)
-        return macd_result.iloc[:, 0], macd_result.iloc[:, 1], macd_result.iloc[:, 2]
+        ema_12 = prices.ewm(span=12, adjust=False).mean()
+        ema_26 = prices.ewm(span=26, adjust=False).mean()
+        macd_line = ema_12 - ema_26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        histogram = macd_line - signal_line
+        return macd_line, signal_line, histogram
 
     def calculate_atr(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
         """Calculate Average True Range."""
-        return ta.atr(high=high, low=low, close=close, length=period)
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return atr
 
     def find_support_resistance(self, prices: pd.Series, lookback: int = 20) -> Tuple[float, float]:
         """

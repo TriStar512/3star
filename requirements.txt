@@ -1,38 +1,34 @@
 # Core async & HTTP
-aiohttp==3.9.1
-websockets==12.0
+aiohttp>=3.9.0
+websockets>=12.0
 
 # Data processing & technical indicators
-pandas==2.1.4
-numpy==1.24.3
-pandas-ta==0.3.14b0
+pandas>=1.5.0
+numpy>=1.24.0
 
 # Crypto exchange APIs
-ccxt==4.0.52
+ccxt>=4.0.0
 
 # Config & validation
-pydantic==2.5.0
-python-dotenv==1.0.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
 
 # UI & logging
-rich==13.7.0
-colorama==0.4.6
-
-# Database
-sqlite3-python==1.0.0
+rich>=13.0.0
+colorama>=0.4.0
 
 # Web & webhooks
-flask==3.0.0
-flask-cors==4.0.0
+flask>=3.0.0
+flask-cors>=4.0.0
 
 # API clients
-requests==2.31.0
+requests>=2.31.0
 
 # Testing
-pytest==7.4.3
-pytest-asyncio==0.21.1
-pytest-cov==4.1.0
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
 
 # Utilities
-python-dateutil==2.8.2
-pytz==2023.3
+python-dateutil>=2.8.0
+pytz>=2023.0
