@@ -39,6 +39,8 @@ Tests: `pytest JARBIS_Crypto/tests` (32 tests, all passing).
 | `webhooks.py` | Flask `POST /news`, `POST /emergency` (auth `X-JARBIS-Secret`) + Slack notify |
 | `utils.py` | Formatters, `async_retry`, sentiment classifier |
 | `tests/` | `test_leverage.py`, `test_sentiment.py`, `test_risk.py`, `test_signals.py` |
+| `artifacts/CexLeverageTracker.jsx` | React Live Artifact: top-10 perp leverage tracker (Bybit/OKX, public REST, auto-refresh, sortable) |
+| `artifacts/README.md` | Live Artifacts index + usage notes |
 
 ## Leverage formula (core invariant)
 
@@ -94,6 +96,15 @@ Worked example from spec: `base=2, sent=+0.8, ATR=1.1, heat=0.2` → **2.46x**.
 - No check runs configured on the repo yet (no CI workflow)
 - No review comments, no reviews, no issue comments
 - Session is subscribed to PR activity
+
+## Live Artifacts (React, claude.ai/code-friendly)
+
+- `JARBIS_Crypto/artifacts/CexLeverageTracker.jsx` — CEX perp leverage
+  tracker. Top 10 coins (BTC, ETH, BNB, SOL, XRP, ADA, DOGE, AVAX, LINK,
+  MATIC). Bybit + OKX public REST; columns: price, 24h %, 24h vol, max
+  leverage, funding, spread, bid, ask — all sortable. Persists CEX choice,
+  refresh interval, last-update, sort state via `window.storage` (falls
+  back to `localStorage`). 30s auto-refresh by default.
 
 ## Next steps (not started)
 
