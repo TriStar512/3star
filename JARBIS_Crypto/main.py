@@ -72,9 +72,21 @@ class JarbisBot:
         self.router = OrderRouter(self.broker, self.risk, self.settings)
         self.webhooks.start()
 
-        banner = "[PAPER]" if self.settings.paper_trade else "[LIVE]"
-        self.console.print(f"[bold cyan]JARBIS Crypto starting {banner}[/]")
+        # Live boot: pull initial balance/position snapshot before we
+        # render the first dashboard frame.
+        if not self.settings.paper_trade:
+            await self.broker.refresh_live_state()
+
+        banner = self._mode_banner()
+        self.console.print(f"[bold cyan]JARBIS Crypto starting[/] {banner}")
         slack_notify(f"JARBIS Crypto starting {banner}", self.settings)
+
+    def _mode_banner(self) -> str:
+        if self.settings.paper_trade:
+            return "[yellow][PAPER][/]"
+        net = "TESTNET" if self.settings.hl_testnet else "MAINNET"
+        color = "yellow" if self.settings.hl_testnet else "red bold"
+        return f"[{color}][LIVE · HL {net}][/]"
 
     async def stop(self) -> None:
         self.running = False
@@ -89,6 +101,10 @@ class JarbisBot:
         import time
         poll = self.settings.signal_poll_seconds
         while self.running:
+            # 0) live mode: refresh balance + positions from HL user_state
+            if not self.settings.paper_trade:
+                await self.broker.refresh_live_state()
+
             # 1) pull fresh prices + mark-to-market existing positions
             for ticker in self.settings.trading_pairs:
                 try:
@@ -241,16 +257,7 @@ class JarbisBot:
                 self.settings.paper_trade = True
                 self.console.print("[yellow]paper mode ON[/]")
             elif cmd == "live":
-                self.console.print(
-                    "[red bold]LIVE mode requires 3 confirmations. Type !live confirm three times.[/]"
-                )
-                # simple confirmation flow: look at args
-                if args and args[0] == "confirm":
-                    self._live_confirms = getattr(self, "_live_confirms", 0) + 1
-                    if self._live_confirms >= 3:
-                        self.settings.paper_trade = False
-                        self.console.print("[red bold]LIVE mode ON[/]")
-                        self._live_confirms = 0
+                await self._handle_live_command(args)
             elif cmd == "close":
                 await self._close_positions(args[0] if args else None)
             elif cmd == "emergency":
@@ -308,12 +315,78 @@ class JarbisBot:
                 )
         self._flush_closed()
 
+    async def _handle_live_command(self, args: list) -> None:
+        """!live confirm (x3) → testnet · !live mainnet confirm (x3) → mainnet.
+
+        Three confirmations are still required even on testnet — habit
+        forming. Mainnet additionally needs the explicit ``mainnet``
+        keyword to flip ``hl_testnet=False`` before the first confirm.
+        """
+        want_mainnet = bool(args and args[0] == "mainnet")
+        confirm_args = args[1:] if want_mainnet else args
+        is_confirm = bool(confirm_args and confirm_args[0] == "confirm")
+
+        if not self.settings.hl_wallet_address or not self.settings.hl_private_key:
+            self.console.print(
+                "[red]live mode requires HL_WALLET_ADDRESS and HL_PRIVATE_KEY in .env[/]"
+            )
+            return
+
+        if not is_confirm:
+            target = "MAINNET" if want_mainnet else f"TESTNET ({'mainnet' if not self.settings.hl_testnet else 'testnet'} currently)"
+            self.console.print(
+                f"[red bold]LIVE on {target} requires 3 confirmations.[/]\n"
+                f"Type [bold]!live{' mainnet' if want_mainnet else ''} confirm[/] three times."
+            )
+            self._live_confirms = 0
+            self._live_target_mainnet = want_mainnet
+            return
+
+        # accumulating confirmations — must stay on the same target
+        existing_target = getattr(self, "_live_target_mainnet", False)
+        if want_mainnet != existing_target:
+            self._live_confirms = 0
+            self._live_target_mainnet = want_mainnet
+        self._live_confirms = getattr(self, "_live_confirms", 0) + 1
+        remaining = 3 - self._live_confirms
+        if remaining > 0:
+            self.console.print(
+                f"[yellow]live confirm {self._live_confirms}/3 "
+                f"({'mainnet' if want_mainnet else 'testnet'})[/]"
+            )
+            return
+
+        # 3/3 — flip the switch
+        self.settings.paper_trade = False
+        self.settings.hl_testnet = not want_mainnet
+        try:
+            self.broker._init_live_exchange()
+            await self.broker.refresh_live_state()
+        except Exception as exc:  # noqa: BLE001
+            self.settings.paper_trade = True
+            self.console.print(f"[red]live init failed, reverting to paper: {exc}[/]")
+            self._live_confirms = 0
+            return
+        self._live_confirms = 0
+        net = "MAINNET" if want_mainnet else "TESTNET"
+        self.console.print(f"[red bold]LIVE mode ON · Hyperliquid {net}[/]")
+        slack_notify(f"LIVE mode ON · Hyperliquid {net}", self.settings)
+
     async def _emergency_flatten(self) -> None:
         self.console.print("[red bold]!! EMERGENCY FLATTEN !![/]")
         for ticker in list(self.broker.positions().keys()):
             price = self.prices.get(ticker) or await self.broker.get_price(ticker)
-            self.broker.force_close(ticker, price, "emergency")
+            if self.settings.paper_trade:
+                self.broker.force_close(ticker, price, "emergency")
+            else:
+                # live: cancel bracket + market close on Hyperliquid
+                try:
+                    await self.broker.emergency_close_live(ticker)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("live emergency close %s failed: %s", ticker, exc)
         self._flush_closed()
+        if not self.settings.paper_trade:
+            await self.broker.refresh_live_state()
         slack_notify("EMERGENCY flatten triggered", self.settings)
 
     # ---- helpers ----
@@ -435,7 +508,10 @@ class JarbisBot:
   !emergency                  — panic-close everything
   !risk set <pct>             — e.g. !risk set 0.015
   !leverage set <x> | auto    — override or resume dynamic
-  !paper | !live confirm      — toggle modes (live needs 3 confirms)
+  !start | !stop              — enable/disable new entries
+  !paper                      — switch to paper trading
+  !live confirm (x3)          — go live on Hyperliquid TESTNET
+  !live mainnet confirm (x3)  — go live on Hyperliquid MAINNET (real $$$)
   !news TICKER: headline      — inject manual news
   !stats | !heat | !sentiment | !positions
   !on-chain TICKER            — dump latest on-chain signal

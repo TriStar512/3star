@@ -201,19 +201,45 @@ signal label, exit reason (`tp1`, `tp2`, `sl`, `timeout`, `emergency`,
 
 ## Going live
 
-Live order placement against Hyperliquid is intentionally stubbed
-(`broker.place_limit_order` raises `NotImplementedError` when
-`PAPER_TRADE=false`). To enable it:
+Live signed orders against Hyperliquid are wired through
+`hyperliquid_exchange.HyperliquidExchange`. Each entry the bot opens
+becomes a four-order **bracket**: limit GTC entry → reduce-only SL
+trigger (market) → reduce-only TP1 trigger (50% of qty) → reduce-only
+TP2 trigger (50%). If any leg fails after the entry is placed, the
+client cancels every open order on that coin so we never leave naked
+exposure.
 
-1. Add an EVM signer. Hyperliquid orders are signed L1 actions; the
-   `hyperliquid-python-sdk` package wraps this. Store the key in a local
-   OS keystore, **not** `.env`.
-2. Seed the wallet on Hyperliquid via the UI (Metamask deposit) before
-   the bot tries to place orders.
-3. Run paper trading for **≥ 2 weeks** to validate your config.
-4. Enable live with **≤ 1% of intended capital** first.
-5. Monitor 24/7 for the first week; use `!emergency` or the dashboard's
-   ⛔ button liberally.
+```bash
+# .env
+PAPER_TRADE=false
+HL_WALLET_ADDRESS=0xYourMetamaskAccount
+HL_PRIVATE_KEY=0xPrivateKeyForThatAccount
+HL_TESTNET=true            # ALWAYS testnet first
+```
+
+Safety rails:
+
+1. **Address ↔ key match check.** The client refuses to start if the
+   private key doesn't derive `HL_WALLET_ADDRESS`.
+2. **Testnet by default.** `HL_TESTNET=true` is the seed value; flip to
+   `false` only after a clean testnet smoke run.
+3. **3× confirmation to flip.** From the running CLI:
+   - `!live confirm` × 3 → live on **testnet**
+   - `!live mainnet confirm` × 3 → live on **mainnet** (real funds)
+4. **Risk gates intact.** Every live order still flows through
+   `RiskManager`: 2% max loss, 5% notional cap, 4 concurrent, hard
+   leverage cap, 30-min timeout, 3% portfolio hard loss.
+5. **Emergency stays live.** `!emergency` (or the dashboard ⛔) cancels
+   every bracket and market-closes every open position via
+   `exchange.market_close`.
+
+Recommended rollout:
+
+1. Run paper for **≥ 2 weeks** to validate signal quality.
+2. Move to **testnet** with funded testnet USDC; let the bot run a few
+   days unattended.
+3. Move to **mainnet** with **≤ 1% of intended capital**.
+4. Monitor 24/7 the first week. Pull the plug at the first surprise.
 
 ## Live Artifact dashboard
 

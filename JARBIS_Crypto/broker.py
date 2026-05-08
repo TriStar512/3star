@@ -7,9 +7,14 @@ is used for candles / ticker context / funding / max-leverage metadata.
 Bybit and Binance remain wired only as read-only fallbacks for market
 data redundancy (same public endpoints as before, no keys required).
 
-The paper broker simulates fills at the requested limit price and tracks
-positions in-memory. Signed order placement against Hyperliquid must be
-wired in before enabling ``PAPER_TRADE=false``.
+Two execution backends:
+  - PaperBroker (in-memory) — used whenever ``PAPER_TRADE=true``; fills
+    at the limit price and tracks SL/TP via ``mark_to_market``.
+  - HyperliquidExchange (signed) — used when ``PAPER_TRADE=false``;
+    places a limit entry plus three reduce-only trigger legs (SL, TP1
+    50%, TP2 50%) on the user's Metamask-derived account. Live positions
+    are read from Hyperliquid's ``user_state`` so the dashboard reflects
+    on-chain truth instead of a local cache.
 """
 from __future__ import annotations
 
@@ -422,6 +427,10 @@ class Broker:
         self.fallbacks: List[_DataClient] = []
         self.paper = PaperBroker(self.settings)
         self.venue_name: str = self.settings.primary_broker
+        # Lazy: only constructed when paper_trade=False AND keys present.
+        self.live_exchange = None  # type: Optional["HyperliquidExchange"]
+        self._live_state_cache: dict = {}
+        self._live_open_orders: Dict[str, dict] = {}
 
     async def __aenter__(self) -> "Broker":
         self.session = aiohttp.ClientSession()
@@ -434,11 +443,36 @@ class Broker:
             "binance":     (bn, [hl, by]),
         }
         self.primary, self.fallbacks = order[self.settings.primary_broker]
+        if not self.settings.paper_trade:
+            self._init_live_exchange()
         return self
 
     async def __aexit__(self, *exc) -> None:
         if self.session:
             await self.session.close()
+
+    def _init_live_exchange(self) -> None:
+        """Construct the Hyperliquid signed-order client.
+
+        Only called when ``paper_trade=False``. Imports are local so that
+        paper-only deployments don't pay the cost of pulling in
+        ``hyperliquid-python-sdk`` / ``eth_account``.
+        """
+        from .hyperliquid_exchange import HyperliquidExchange
+        if not self.settings.hl_wallet_address or not self.settings.hl_private_key:
+            raise RuntimeError(
+                "PAPER_TRADE=false but HL_WALLET_ADDRESS / HL_PRIVATE_KEY are not set"
+            )
+        self.live_exchange = HyperliquidExchange(
+            wallet_address=self.settings.hl_wallet_address,
+            private_key=self.settings.hl_private_key,
+            testnet=self.settings.hl_testnet,
+        )
+        log.info(
+            "live exchange ready (network=%s, address=%s)",
+            "TESTNET" if self.settings.hl_testnet else "MAINNET",
+            self.settings.hl_wallet_address,
+        )
 
     async def _try_chain(self, fn_name: str, *args, **kwargs):
         assert self.primary
@@ -479,23 +513,108 @@ class Broker:
     async def place_limit_order(self, **kwargs) -> Order:
         if self.settings.paper_trade:
             return await self.paper.place_limit_order(**kwargs)
-        raise NotImplementedError(
-            "Live order placement not wired. Hyperliquid orders need an EVM "
-            "signer (Metamask private key). Set PAPER_TRADE=true until the "
-            "signing layer is added."
+        if self.live_exchange is None:
+            raise RuntimeError("live_exchange not initialized — call _init_live_exchange()")
+
+        ticker = kwargs["ticker"].upper()
+        result = await self.live_exchange.place_bracketed_order(
+            coin=ticker,
+            is_buy=(kwargs["direction"] == "long"),
+            qty=kwargs["quantity"],
+            entry_px=kwargs["price"],
+            sl_px=kwargs["stop_loss"],
+            tp1_px=kwargs["take_profit_1"],
+            tp2_px=kwargs["take_profit_2"],
+            leverage=int(round(kwargs["leverage"])),
+        )
+        if not result.ok:
+            raise RuntimeError(f"live order failed: {result.error}")
+
+        # Track the bracket so we can cancel it on emergency / manual close.
+        self._live_open_orders[ticker] = {
+            "entry_oid": result.entry_oid,
+            "sl_oid":    result.sl_oid,
+            "tp1_oid":   result.tp1_oid,
+            "tp2_oid":   result.tp2_oid,
+            "direction": kwargs["direction"],
+            "leverage":  kwargs["leverage"],
+            "stop_loss": kwargs["stop_loss"],
+            "tp1":       kwargs["take_profit_1"],
+            "tp2":       kwargs["take_profit_2"],
+        }
+        log.info("[live] bracket placed for %s: entry=%s sl=%s tp1=%s tp2=%s",
+                 ticker, result.entry_oid, result.sl_oid, result.tp1_oid, result.tp2_oid)
+
+        return Order(
+            id=str(result.entry_oid) if result.entry_oid else f"hl-{ticker}",
+            ticker=ticker,
+            direction=kwargs["direction"],
+            quantity=kwargs["quantity"],
+            price=kwargs["price"],
+            leverage=kwargs["leverage"],
         )
 
+    async def emergency_close_live(self, ticker: str) -> None:
+        """Cancel the bracket and market-close any open position on ``ticker``."""
+        if self.live_exchange is None:
+            return
+        await self.live_exchange.market_close(ticker.upper())
+        self._live_open_orders.pop(ticker.upper(), None)
+
+    # --- live-state refresh (called from the asyncio loop) ---
+    async def refresh_live_state(self) -> None:
+        """Pull the latest balance + positions from Hyperliquid."""
+        if self.settings.paper_trade or self.live_exchange is None:
+            return
+        try:
+            self._live_state_cache = await self.live_exchange.get_balance_and_positions()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("live state refresh failed: %s", exc)
+
+    # --- accessors used by the rest of the bot + dashboard ---
+
     def positions(self) -> Dict[str, Position]:
-        return self.paper.positions if self.settings.paper_trade else {}
+        if self.settings.paper_trade:
+            return self.paper.positions
+        # Synthesize Position objects from the cached live state.
+        out: Dict[str, Position] = {}
+        bracket_by_coin = self._live_open_orders
+        for p in self._live_state_cache.get("positions", []) or []:
+            coin = (p.get("coin") or "").upper()
+            if not coin:
+                continue
+            size = float(p.get("size") or 0.0)
+            if size == 0:
+                continue
+            bracket = bracket_by_coin.get(coin, {})
+            out[coin] = Position(
+                ticker=coin,
+                direction="long" if size > 0 else "short",
+                entry_price=float(p.get("entry_price") or 0.0),
+                quantity=abs(size),
+                leverage=float(p.get("leverage") or bracket.get("leverage") or 1.0),
+                stop_loss=float(bracket.get("stop_loss") or 0.0),
+                take_profit_1=float(bracket.get("tp1") or 0.0),
+                take_profit_2=float(bracket.get("tp2") or 0.0),
+                opened_at=pd.Timestamp.utcnow(),
+                order_id=str(bracket.get("entry_oid") or f"hl-{coin}"),
+            )
+        return out
 
     def closed_positions(self) -> List[Position]:
-        return self.paper.closed_positions if self.settings.paper_trade else []
+        # Live trade history isn't synthesized here; the SQLite log is the
+        # source of truth for closed trades regardless of mode.
+        return self.paper.closed_positions
 
     def available_margin(self) -> float:
-        return self.paper.available_margin() if self.settings.paper_trade else 0.0
+        if self.settings.paper_trade:
+            return self.paper.available_margin()
+        return float(self._live_state_cache.get("withdrawable") or 0.0)
 
     def cash(self) -> float:
-        return self.paper.cash if self.settings.paper_trade else 0.0
+        if self.settings.paper_trade:
+            return self.paper.cash
+        return float(self._live_state_cache.get("account_value") or 0.0)
 
     def mark_to_market(self, ticker: str, price: float) -> Optional[str]:
         if not self.settings.paper_trade:

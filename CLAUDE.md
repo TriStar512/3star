@@ -33,8 +33,12 @@ on-chain confirmation.
    ```
    Higher sentiment + lower vol + lower heat ⇒ more leverage, capped.
 4. **Metamask self-custody for live mode.** `HL_WALLET_ADDRESS` +
-   `HL_PRIVATE_KEY` (off-disk in production). Live order placement is
-   stubbed with `NotImplementedError` until the signer is wired.
+   `HL_PRIVATE_KEY` (off-disk in production). Signed orders go through
+   `hyperliquid_exchange.HyperliquidExchange.place_bracketed_order`:
+   limit GTC entry + reduce-only SL trigger + reduce-only TP1 (50%) +
+   reduce-only TP2 (50%). Failures roll back via `cancel_all_for_coin`.
+   `HL_TESTNET=true` is the default; mainnet flip needs
+   `!live mainnet confirm` × 3 in the CLI.
 5. **Risk hard limits (unchanged):** 2% max loss / trade, 5% max notional,
    4 concurrent, 30-min timeout, 3% portfolio hard loss, emergency flatten.
 
@@ -54,7 +58,8 @@ Tests: `pytest JARBIS_Crypto/tests` — 38 tests, all passing.
 |---|---|
 | `main.py` | Async event loop: `signal_loop`, `sentiment_loop`, `command_loop` + Rich Live dashboard. Has `bot_active` flag + `state_snapshot()` for the dashboard. `!start` / `!stop` CLI commands gate new entries without killing the process. |
 | `config.py` | `pydantic-settings` typed config. Exports `ALLOWED_COINS` constant + validator that rejects non-top-10 tickers. `primary_broker` defaults to `"hyperliquid"`. |
-| `broker.py` | `HyperliquidClient` (primary) + `BybitClient` + `BinanceClient` (data fallbacks only) + `PaperBroker`. `Broker._try_chain(...)` walks the fallback list for every data call. |
+| `broker.py` | `HyperliquidClient` (primary) + `BybitClient` + `BinanceClient` (data fallbacks only) + `PaperBroker`. `Broker._try_chain(...)` walks the fallback list for every data call. Lazily wires `HyperliquidExchange` and routes orders + state to it when `paper_trade=False`. |
+| `hyperliquid_exchange.py` | Async facade over `hyperliquid-python-sdk`. `place_bracketed_order` posts entry + 3 reduce-only triggers; `cancel_all_for_coin` rolls back; `get_balance_and_positions` normalizes `user_state`. Refuses to start if private key doesn't derive `HL_WALLET_ADDRESS`. |
 | `signals.py` | EMA / RSI / MACD / ATR / support-resistance + `SignalEngine` (4H trend, 1H momentum, 15m breakout). |
 | `sentiment.py` | CryptoCompare + NewsAPI crawl, keyword scoring, per-ticker time-decayed score, manual injection. |
 | `on_chain.py` | Santiment exchange-balance + Glassnode netflow bullish-signal check. |
@@ -65,7 +70,7 @@ Tests: `pytest JARBIS_Crypto/tests` — 38 tests, all passing.
 | `dashboard.py` | Rich terminal panels: metrics / risk / recent trades. |
 | `webhooks.py` | Flask app (runs in thread) serving `/state` (public, CORS `*`), `/bot/start`, `/bot/stop`, `/news`, `/emergency`, `/healthz`. |
 | `utils.py` | Formatters, `async_retry`, sentiment classifier. |
-| `tests/` | `test_leverage.py`, `test_sentiment.py`, `test_risk.py`, `test_signals.py`, `test_config.py` — 38 tests, all passing. |
+| `tests/` | `test_leverage.py`, `test_sentiment.py`, `test_risk.py`, `test_signals.py`, `test_config.py`, `test_hyperliquid_exchange.py` — 43 tests, all passing. |
 | `artifacts/JarbisDashboard.jsx` | **Live Artifact** — React dashboard. On/off bot button, confidence gauge (red→yellow→green gradient), @DeItaone X-timeline embed, Hyperliquid top-10 table, positions table, recent trades, stats. Sized for half-screen 1280×1440. Polls `/state` and issues `/bot/*` control calls. |
 | `artifacts/README.md` | Live Artifacts index + usage notes. |
 
@@ -138,8 +143,8 @@ CORS enabled (`*`) so the Live Artifact on claude.ai can poll localhost.
 
 ## Next steps (not started)
 
-- [ ] Wire Hyperliquid signed actions for live mode (`hyperliquid-python-sdk`)
 - [ ] Hyperliquid testnet smoke run with a Metamask burner wallet
+- [ ] iPad PWA build (paused mid-build to wire HL signer first)
 - [ ] Add a GitHub Actions CI workflow (pytest on push)
 - [ ] Backtest engine over historical 15m/1h candles
 - [ ] ≥ 2 weeks paper-mode validation before any live switch

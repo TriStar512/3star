@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     hl_api_url: str = "https://api.hyperliquid.xyz"
     hl_wallet_address: str = ""  # 0x... Metamask account used to sign trades
     hl_private_key: str = ""     # only used in live mode; keep off disk in prod
+    hl_testnet: bool = True      # default ON — flip only after testnet smoke run
 
     bybit_api_key: str = ""
     bybit_api_secret: str = ""
