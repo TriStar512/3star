@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <title>JARBIS Crypto</title>
+
+  <!-- iOS / iPadOS PWA meta -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="JARBIS" />
+  <meta name="theme-color" content="#0e7490" />
+
+  <!-- Icons -->
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png" />
+  <link rel="manifest" href="manifest.webmanifest" />
+
+  <!-- Tailwind (CDN, fine for a personal LAN app) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React + Babel standalone so there's no build step -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    html, body, #root { height: 100%; }
+    body {
+      margin: 0;
+      background: #020617;
+      color: #e2e8f0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", monospace;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior-y: none;
+    }
+    /* Honor the iPhone/iPad safe areas when installed full-screen */
+    #root {
+      padding: env(safe-area-inset-top) env(safe-area-inset-right)
+               env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+    /* Bigger tap targets on iOS */
+    button, [role="button"] { min-height: 44px; }
+    input, select { min-height: 40px; font-size: 16px; }  /* 16px avoids iOS zoom-on-focus */
+    /* Hide scrollbars but keep scroll */
+    .scroll-touch { -webkit-overflow-scrolling: touch; }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div class="w-full h-full flex items-center justify-center text-slate-400 text-sm">
+      Loading JARBIS…
+    </div>
+  </div>
+
+  <!-- App shell -->
+  <script type="text/babel" src="app.js"></script>
+</body>
+</html>
