@@ -20,7 +20,8 @@ on-chain confirmation.
    for the candle / ticker chain. They never route orders.
 2. **Top-10 coin universe.** `config.ALLOWED_COINS = [BTC, ETH, BNB, SOL,
    XRP, ADA, DOGE, AVAX, LINK, MATIC]`. A pydantic validator rejects
-   any `TRADING_PAIRS` value outside this list at startup.
+   any `TRADING_PAIRS` value outside this list at startup. The
+   TradingView alert parser enforces the same list.
 3. **Dynamic leverage scales with confidence** — the existing formula:
    ```
    leverage = clamp(
@@ -68,9 +69,11 @@ Tests: `pytest JARBIS_Crypto/tests` — 38 tests, all passing.
 | `orders.py` | `OrderRouter.execute(signal, atr_ratio)` — glue: leverage → sizing → broker. |
 | `logger.py` | `TradeLogger` — SQLite (`trades`, `portfolio_snapshots`) + CSV mirror, stats. |
 | `dashboard.py` | Rich terminal panels: metrics / risk / recent trades. |
-| `webhooks.py` | Flask app (runs in thread) serving `/state` (public, CORS `*`), `/bot/start`, `/bot/stop`, `/news`, `/emergency`, `/healthz`. |
+| `webhooks.py` | Flask app (runs in thread) serving `/state` (public, CORS `*`), `/bot/start`, `/bot/stop`, `/news`, `/emergency`, `/tradingview`, `/healthz`. |
+| `tradingview.py` | TradingView webhook integration. `parse_alert` normalizes TV ticker forms (BTCUSDT, BINANCE:BTCUSDT.P, …) to bare coin codes, validates against the top-10 universe, and maps buy/long/sell/short/close/exit to a direction. |
 | `utils.py` | Formatters, `async_retry`, sentiment classifier. |
-| `tests/` | `test_leverage.py`, `test_sentiment.py`, `test_risk.py`, `test_signals.py`, `test_config.py`, `test_hyperliquid_exchange.py` — 43 tests, all passing. |
+| `tests/` | `test_leverage.py`, `test_sentiment.py`, `test_risk.py`, `test_signals.py`, `test_config.py`, `test_hyperliquid_exchange.py`, `test_tradingview.py` — 77 tests, all passing. |
+| `docs/tradingview_alerts.md` | Pine Script alert template, ngrok / Cloudflare Tunnel recipe, payload schema, smoke-test curl. |
 | `artifacts/JarbisDashboard.jsx` | **Live Artifact** — React dashboard. On/off bot button, confidence gauge (red→yellow→green gradient), @DeItaone X-timeline embed, Hyperliquid top-10 table, positions table, recent trades, stats. Sized for half-screen 1280×1440. Polls `/state` and issues `/bot/*` control calls. |
 | `artifacts/README.md` | Live Artifacts index + usage notes. |
 

@@ -38,8 +38,14 @@ candles, score news sentiment, and wait for a signal on BTC / ETH / SOL / XRP.
 - **Single-venue execution** — Hyperliquid perpetuals, Metamask self-custody.
 - **Top-10 universe lock** — `config.ALLOWED_COINS` rejects any non-top-10
   ticker at startup; default `TRADING_PAIRS` is the full ten.
-- **Multi-timeframe signals** — 4H EMA trend + 1H RSI/MACD momentum + 15m
-  breakout with ATR-scaled stops and 1.5R / 3R take-profits.
+- **TradingView webhook signals** — Pine Script alerts (VuManChu Cipher B
+  buy/sell diamonds, MACD crosses, your own strategies) POST to
+  `/tradingview` and drive bracketed entries through the same risk +
+  leverage stack. See `docs/tradingview_alerts.md` for the alert JSON
+  template and ngrok setup.
+- **Multi-timeframe internal signals** (when TV alerts aren't firing):
+  4H EMA trend + 1H RSI/MACD momentum + 15m breakout with ATR-scaled
+  stops and 1.5R / 3R take-profits.
 - **Dynamic leverage** — base 2x × sentiment multiplier × ATR20/ATR50 ×
   portfolio-heat discount, hard-capped at 3x, floor-clamped at 1x (spot).
 - **News sentiment** — CryptoCompare + NewsAPI crawl, keyword scoring in

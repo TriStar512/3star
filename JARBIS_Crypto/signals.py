@@ -176,6 +176,60 @@ class SignalEngine:
             ),
         )
 
+    async def build_signal_from_alert(
+        self,
+        ticker: str,
+        direction: str,
+        sentiment_score: float = 0.0,
+        on_chain_confirmation: bool = False,
+    ) -> Optional[Signal]:
+        """Construct a Signal from an external trigger (e.g. TradingView VMC).
+
+        We trust the alert's direction — no veto on RSI/MACD/EMA — but
+        we still derive ATR-scaled stops + TPs from the current 15m
+        candles so the bracket placed by the broker is properly sized.
+        """
+        if direction not in ("long", "short"):
+            return None
+        df = await self.broker.get_candles(ticker, "15m", limit=80)
+        if df.empty or len(df) < 30:
+            return None
+        current_price = float(df["close"].iloc[-1])
+        atr_15m = float(atr(df, 14).iloc[-1])
+        if atr_15m <= 0:
+            return None
+        support, resistance = support_resistance(df, window=20)
+        if direction == "long":
+            stop_loss = min(support, current_price - atr_15m * 1.0)
+            tp1 = current_price + atr_15m * 1.5
+            tp2 = current_price + atr_15m * 3.0
+        else:
+            stop_loss = max(resistance, current_price + atr_15m * 1.0)
+            tp1 = current_price - atr_15m * 1.5
+            tp2 = current_price - atr_15m * 3.0
+
+        # Trend label is informational only here.
+        close_4h = (await self.broker.get_candles(ticker, "4h", limit=80))["close"]
+        if not close_4h.empty:
+            trend = "up" if ema(close_4h, 20).iloc[-1] > ema(close_4h, 50).iloc[-1] else "down"
+        else:
+            trend = "unknown"
+
+        return Signal(
+            ticker=ticker,
+            direction=direction,
+            entry_price=current_price,
+            stop_loss=stop_loss,
+            take_profit_1=tp1,
+            take_profit_2=tp2,
+            atr_15m=atr_15m,
+            rsi_1h=0.0,  # not consulted for TV-driven entries
+            trend_4h=trend,
+            sentiment_score=sentiment_score,
+            on_chain_confirmation=on_chain_confirmation,
+            reason=f"tradingview alert · trend4h={trend}",
+        )
+
     # Convenience for the leverage module: ATR ratio on 15m.
     async def atr_ratio(self, ticker: str) -> float:
         df = await self.broker.get_candles(ticker, "15m", limit=80)

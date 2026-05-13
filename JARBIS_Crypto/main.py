@@ -214,6 +214,102 @@ class JarbisBot:
         elif ev.kind == "bot_stop":
             self.bot_active = False
             self.console.print("[yellow]bot deactivated via webhook[/]")
+        elif ev.kind == "tradingview":
+            await self._execute_tradingview(ev.payload)
+
+    async def _execute_tradingview(self, payload: dict) -> None:
+        """Turn a TradingView alert into a real bracketed entry (or close).
+
+        VuManChu Cipher B (and similar) alerts arrive here. We trust the
+        direction but still run the order through the risk + leverage +
+        broker stack so position sizing, leverage caps, and reduce-only
+        SL/TP brackets stay identical to internally-generated signals.
+        """
+        assert self.signal_engine and self.router and self.risk
+        ticker = payload["ticker"]
+        direction = payload["direction"]
+        indicator = payload.get("indicator") or "tradingview"
+        signal_name = payload.get("signal") or ""
+
+        # 1) close path — flatten regardless of bot_active
+        if direction == "close":
+            if ticker not in self.broker.positions():
+                self.console.print(f"[dim]TV close {ticker}: no position[/]")
+                return
+            if self.settings.paper_trade:
+                price = self.prices.get(ticker) or await self.broker.get_price(ticker)
+                self.broker.force_close(ticker, price, f"tv:{indicator}")
+            else:
+                try:
+                    await self.broker.emergency_close_live(ticker)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("TV live close %s failed: %s", ticker, exc)
+                    return
+            self._flush_closed()
+            self.console.print(f"[cyan]TV close {ticker} ({indicator}/{signal_name})[/]")
+            return
+
+        # 2) entry path — respect on/off + universe + concurrency gates
+        if not self.bot_active:
+            self.console.print(f"[dim]TV {direction} {ticker} ignored (bot idle)[/]")
+            return
+        if ticker not in self.settings.trading_pairs:
+            self.console.print(f"[yellow]TV {ticker}: not in trading universe[/]")
+            return
+        existing = self.broker.positions().get(ticker)
+        if existing:
+            # If the alert says the opposite direction, flip the position.
+            if existing.direction != direction:
+                self.console.print(
+                    f"[yellow]TV flip {ticker}: closing {existing.direction} -> {direction}[/]"
+                )
+                if self.settings.paper_trade:
+                    price = self.prices.get(ticker) or await self.broker.get_price(ticker)
+                    self.broker.force_close(ticker, price, f"tv_flip:{indicator}")
+                else:
+                    await self.broker.emergency_close_live(ticker)
+                self._flush_closed()
+            else:
+                self.console.print(
+                    f"[dim]TV {ticker}: already {direction}, skipping[/]"
+                )
+                return
+
+        # 3) build a signal from the alert + execute through the normal stack
+        try:
+            sentiment = self.sentiment.score_for(ticker)
+            sig = await self.signal_engine.build_signal_from_alert(
+                ticker, direction, sentiment_score=sentiment,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.console.print(f"[red]TV build_signal {ticker}: {exc}[/]")
+            return
+        if sig is None:
+            self.console.print(f"[red]TV {ticker}: not enough candles to size bracket[/]")
+            return
+        # Attach indicator/signal name into the reason for the trade log.
+        sig.reason = f"TV {indicator}/{signal_name} · {sig.reason}"
+
+        try:
+            atr_ratio_v = await self.signal_engine.atr_ratio(ticker)
+            result = await self.router.execute(sig, atr_ratio=atr_ratio_v)
+        except Exception as exc:  # noqa: BLE001
+            self.console.print(f"[red]TV execute {ticker}: {exc}[/]")
+            return
+        if not result:
+            self.console.print(f"[yellow]TV {ticker}: rejected by risk gates[/]")
+            return
+        self.logger.log_open(result, on_chain_label=f"tv:{indicator}")
+        self.current_leverage[ticker] = result.leverage.leverage
+        self.console.print(
+            f"[green]TV {direction.upper()} {ticker} @ "
+            f"{fmt_price(sig.entry_price)} lev={result.leverage.leverage:.2f}x[/]"
+        )
+        slack_notify(
+            f"[TV·{indicator}] {ticker} {direction.upper()} @ "
+            f"{fmt_price(sig.entry_price)} lev={result.leverage.leverage:.2f}x",
+            self.settings,
+        )
 
     async def sentiment_loop(self) -> None:
         while self.running:

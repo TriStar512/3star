@@ -5,13 +5,13 @@ Endpoints
     POST /emergency   {"confirm": true}
     POST /bot/start   {"confirm": true}  — resume new entries
     POST /bot/stop    {"confirm": true}  — pause new entries
+    POST /tradingview {"secret": "...", "ticker": "...", "action": "..."}
     GET  /state       dashboard snapshot (read-only, public)
     GET  /healthz     liveness probe
 
-Auth: POST endpoints require ``X-JARBIS-Secret: <WEBHOOK_SECRET>``. The
-read-only ``GET /state`` is public so the live artifact on claude.ai can
-poll it without shipping the secret; it contains only market + position
-data, no keys.
+Auth: POST endpoints require ``X-JARBIS-Secret: <WEBHOOK_SECRET>``,
+EXCEPT ``/tradingview`` which accepts the secret in the JSON body
+because TradingView's Pine Script alerts can't set custom headers.
 
 CORS: ``*`` on ``GET /state`` so a Claude Live Artifact served from
 https://claude.ai can fetch the local bot state via
@@ -98,6 +98,35 @@ class WebhookServer:
                 return jsonify({"ok": False, "error": "unauthorized"}), 401
             self.events.put(WebhookEvent(kind="bot_stop", payload={}))
             return jsonify({"ok": True, "bot_active": False})
+
+        @self.app.post("/tradingview")
+        def _tradingview():
+            data = request.get_json(force=True, silent=True) or {}
+            # TV alerts can't set headers, so the secret lives in the body.
+            if data.get("secret") != self.settings.webhook_secret:
+                return jsonify({"ok": False, "error": "unauthorized"}), 401
+            try:
+                from .tradingview import parse_alert
+                ev = parse_alert(data, allowed_tickers=self.settings.trading_pairs)
+            except ValueError as exc:
+                return jsonify({"ok": False, "error": str(exc)}), 400
+            self.events.put(WebhookEvent(kind="tradingview", payload={
+                "ticker":      ev.ticker,
+                "direction":   ev.direction,
+                "price":       ev.price,
+                "indicator":   ev.indicator,
+                "signal":      ev.signal,
+                "timeframe":   ev.timeframe,
+                "received_at": ev.received_at,
+            }))
+            log.info("[tv] %s %s %s/%s @ %s",
+                     ev.ticker, ev.direction.upper(),
+                     ev.indicator, ev.signal, ev.price)
+            return jsonify({
+                "ok": True,
+                "ticker": ev.ticker,
+                "direction": ev.direction,
+            })
 
         @self.app.get("/state")
         def _state():
